@@ -1,3 +1,4 @@
+import { PACKAGE_VERSION } from "../../server/version.js";
 import { execFile } from "node:child_process";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpRequest, type Agent } from "node:http";
@@ -70,11 +71,8 @@ export interface SafeHttpOptions {
     /** Disable automatic HTTP(S) proxy discovery for a specific trusted call. */
     useProxy?: boolean;
     /**
-     * Preserve the original hostname when connecting through a proxy.
-     *
-     * The hostname is still resolved through DNS-over-HTTPS first and all returned
-     * addresses must be public. Use this only for explicitly trusted hosts whose
-     * proxy routing depends on the original hostname.
+     * Preserve the original destination hostname when an explicitly trusted request goes through a proxy.
+     * Public DNS is still validated first. Use only for fixed trusted hosts whose proxy rules require a hostname.
      */
     proxyByHostname?: boolean;
     /** Optional caller cancellation; timeout is only the final hang guard. */
@@ -121,9 +119,9 @@ const proxyAgents = new Map<string, Agent>();
  * When a proxy is used, public DNS resolution is independently checked through
  * DNS-over-HTTPS and the proxied destination is pinned to one of those validated public
  * IPs. TLS SNI and certificate validation still use the original hostname. This keeps
- * proxy support from weakening the public-target SSRF / DNS-rebinding boundary. Explicitly
- * trusted callers may preserve the original proxy hostname after the same public-DNS check
- * when a domain-aware proxy requires it for routing.
+ * proxy support from weakening the public-target SSRF / DNS-rebinding boundary. Explicitly trusted
+ * callers may preserve the hostname after the same public-DNS validation when domain-aware proxy
+ * routing requires it.
  */
 export async function safeHttpGet(
     input: string | URL,
@@ -175,7 +173,7 @@ async function requestOne(
             ? await withinRequestDeadline(resolveProxies(url), deadline, options.signal)
             : [];
     const requestHeaders = {
-        "User-Agent": "codex-mcp/0.1",
+        "User-Agent": `codex-mcp/${PACKAGE_VERSION}`,
         "Accept-Encoding": "identity",
         ...(options.body !== undefined
             ? { "Content-Length": String(Buffer.byteLength(options.body)) }
@@ -236,7 +234,7 @@ async function requestThroughProxy(
         throw new Error(`No public addresses found for ${url.hostname}`);
     }
 
-    const attempts = options.proxyByHostname ? [targets[0]] : [...targets, ...targets];
+    const attempts = options.proxyByHostname ? [targets[0]!] : [...targets, ...targets];
     let lastError: unknown;
     for (const target of attempts) {
         remainingTimeoutMs(deadline);
@@ -244,7 +242,7 @@ async function requestThroughProxy(
         const agent = getProxyAgent(proxy, url.protocol);
         const common = {
             protocol: url.protocol,
-            hostname: options.proxyByHostname ? url.hostname : target.address,
+            hostname: proxyRequestHostname(url.hostname, target.address, options.proxyByHostname === true),
             port,
             path: `${url.pathname}${url.search}`,
             method: options.method,
@@ -330,16 +328,10 @@ function finishRequest(
                 }
                 settled = true;
                 cleanup();
-                const nextOptions =
-                    options.proxyByHostname &&
-                    normalizeHostname(next.hostname).toLowerCase() !==
-                        normalizeHostname(url.hostname).toLowerCase()
-                        ? { ...options, proxyByHostname: false }
-                        : options;
-                void requestOne(next, nextOptions, redirectsRemaining - 1, deadline).then(
-                    resolve,
-                    reject,
-                );
+                const nextOptions = options.proxyByHostname && !sameHostname(url, next)
+                    ? { ...options, proxyByHostname: false }
+                    : options;
+                void requestOne(next, nextOptions, redirectsRemaining - 1, deadline).then(resolve, reject);
                 return;
             }
 
@@ -540,7 +532,7 @@ async function queryDoh(
                 Host: provider.host,
                 Accept: "application/dns-json",
                 "Accept-Encoding": "identity",
-                "User-Agent": "codex-mcp/0.1",
+                "User-Agent": `codex-mcp/${PACKAGE_VERSION}`,
             },
         });
         let total = 0;
@@ -946,6 +938,24 @@ function isSupportedProxyProtocol(protocol: string): boolean {
 
 function isSocksProxy(proxy: URL): boolean {
     return proxy.protocol.startsWith("socks");
+}
+
+/** @internal Exported for deterministic security regression coverage. */
+export function proxyRequestHostname(
+    originalHostname: string,
+    validatedAddress: string,
+    proxyByHostname: boolean,
+): string {
+    return proxyByHostname ? normalizeHostname(originalHostname) : validatedAddress;
+}
+
+/** @internal Exported for deterministic redirect regression coverage. */
+export function proxyHostnameRoutingSurvivesRedirect(current: URL, next: URL): boolean {
+    return sameHostname(current, next);
+}
+
+function sameHostname(left: URL, right: URL): boolean {
+    return normalizeHostname(left.hostname).toLowerCase() === normalizeHostname(right.hostname).toLowerCase();
 }
 
 function normalizeHostname(hostname: string): string {

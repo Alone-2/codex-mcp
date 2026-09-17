@@ -11,20 +11,25 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loopbackHost } from "../lib/http/listen-address.js";
+import { terminateChildProcess } from "../lib/process/tree.js";
 import { getUserConfigDir } from "../config/user-config.js";
 import {
     loadDaemonState,
     loadProjectsFile,
+    removeDaemonState,
     type DaemonState,
     type RegisteredProject,
     type RuntimeIntent,
     type SessionBinding,
 } from "./state.js";
 
-const DAEMON_START_TIMEOUT_MS = 300_000;
+export const DAEMON_START_TIMEOUT_MS = 300_000;
+export const DAEMON_STOP_TIMEOUT_MS = 20_000;
+export const DAEMON_LIFECYCLE_LOCK_WAIT_TIMEOUT_MS = 30_000;
+export const DAEMON_CONTROL_API_VERSION = 1 as const;
 const DAEMON_LOCK_PATH = join(getUserConfigDir(), "daemon.lock");
 const LOCK_STALE_MS = 30_000;
-const LOCK_WAIT_TIMEOUT_MS = 30_000;
 
 export type TunnelObservedState = "off" | "starting" | "connected" | "degraded" | "exited";
 
@@ -36,6 +41,7 @@ export interface TunnelObservedStatus {
 }
 
 export interface DaemonStatusPayload {
+    controlApiVersion: typeof DAEMON_CONTROL_API_VERSION;
     ok: boolean;
     version: string;
     mode: "local" | "public";
@@ -44,6 +50,7 @@ export interface DaemonStatusPayload {
     uptimeMs: number;
     localUrl: string;
     publicMcpUrl?: string;
+    auth: { required: boolean; configured: boolean };
     runtimeIntent: RuntimeIntent;
     tunnel: TunnelObservedStatus;
     projects: Array<RegisteredProject & { boundSessions: number }>;
@@ -85,11 +92,16 @@ export class DaemonControlClient {
         private readonly port: number,
         private readonly token: string,
         private readonly timeoutMs = 10_000,
+        private readonly host = "127.0.0.1",
     ) {}
 
     async status(): Promise<DaemonStatusPayload> {
         const data = await this.request("/daemon/status");
         return normalizeDaemonStatusPayload(data);
+    }
+
+    async checkTools(): Promise<{ toolCount: number; projectCount: number }> {
+        return await this.request("/daemon/check-tools", { method: "POST" }) as { toolCount: number; projectCount: number };
     }
 
     async registerProject(input: { path: string; name?: string }): Promise<RegisteredProject> {
@@ -109,9 +121,7 @@ export class DaemonControlClient {
     }
 
     async listProjectBindings(id: string): Promise<SessionBinding[]> {
-        const data = await this.request(
-            `/daemon/projects/${encodeURIComponent(id)}/bindings`,
-        );
+        const data = await this.request(`/daemon/projects/${encodeURIComponent(id)}/bindings`);
         return (data as ControlProjectBindingsResponse).bindings;
     }
 
@@ -119,18 +129,23 @@ export class DaemonControlClient {
         id: string,
         removeOwnerKeys: string[],
     ): Promise<ControlCleanupBindingsResponse> {
-        const data = await this.request(
-            `/daemon/projects/${encodeURIComponent(id)}/bindings/cleanup`,
-            {
-                method: "POST",
-                body: JSON.stringify({ removeOwnerKeys }),
-            },
-        );
+        const data = await this.request(`/daemon/projects/${encodeURIComponent(id)}/bindings/cleanup`, {
+            method: "POST",
+            body: JSON.stringify({ removeOwnerKeys }),
+        });
         return data as ControlCleanupBindingsResponse;
     }
 
     async shutdown(): Promise<void> {
         await this.request("/daemon/shutdown", { method: "POST" });
+    }
+
+    async logs(lines = 100): Promise<{ path: string; text: string }> {
+        const data = await this.request(`/daemon/logs?lines=${Math.max(1, Math.min(5000, Math.trunc(lines)))}`);
+        return {
+            path: typeof (data as { path?: unknown }).path === "string" ? (data as { path: string }).path : "",
+            text: typeof (data as { text?: unknown }).text === "string" ? (data as { text: string }).text : "",
+        };
     }
 
     private async request(
@@ -140,7 +155,7 @@ export class DaemonControlClient {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
-            const response = await fetch(`http://127.0.0.1:${this.port}${path}`, {
+            const response = await fetch(`http://${loopbackHost(this.host)}:${this.port}${path}`, {
                 method: options.method ?? "GET",
                 headers: {
                     "x-codex-control-token": this.token,
@@ -168,33 +183,81 @@ export class DaemonControlClient {
     }
 }
 
-function normalizeDaemonStatusPayload(value: unknown): DaemonStatusPayload {
-    const raw = value as Partial<DaemonStatusPayload> & {
-        startedAt?: unknown;
-        runtimeIntent?: unknown;
-        tunnel?: { running?: unknown; state?: unknown; restartCount?: unknown; detail?: unknown };
-    };
-    const mode = raw.mode === "public" ? "public" : "local";
-    const legacyIntent: RuntimeIntent = {
-        local: mode === "local",
-        noTunnel: false,
-        tunnelLogs: false,
-    };
-    const runtimeIntent = isRuntimeIntent(raw.runtimeIntent)
-        ? raw.runtimeIntent
-        : legacyIntent;
-    const tunnel = normalizeTunnelObservedStatus(raw.tunnel);
-    const startedAt = typeof raw.startedAt === "string"
-        ? raw.startedAt
-        : typeof raw.startedAt === "number" && Number.isFinite(raw.startedAt)
-          ? new Date(raw.startedAt).toISOString()
-          : new Date().toISOString();
+export function normalizeDaemonStatusPayload(value: unknown): DaemonStatusPayload {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("守护进程返回了无效的状态");
+    }
+    const input = value as Record<string, unknown>;
+    if (input.controlApiVersion !== DAEMON_CONTROL_API_VERSION) {
+        throw new Error(
+            `守护进程控制协议版本不兼容：期望 ${DAEMON_CONTROL_API_VERSION}，实际 ${String(input.controlApiVersion ?? "缺失")}；请更新并重启 codex-mcp`,
+        );
+    }
+    if (input.ok !== true || typeof input.version !== "string" ||
+        !Number.isInteger(input.pid) || (input.pid as number) <= 0 ||
+        !input.version || typeof input.startedAt !== "string" || !input.startedAt ||
+        !Number.isFinite(input.uptimeMs) || (input.uptimeMs as number) < 0 ||
+        typeof input.localUrl !== "string" || !input.localUrl ||
+        (input.publicMcpUrl !== undefined && (typeof input.publicMcpUrl !== "string" || !input.publicMcpUrl)) ||
+        !isRuntimeIntent(input.runtimeIntent) || !isDaemonAuth(input.auth) ||
+        !isTunnelObservedStatus(input.tunnel) ||
+        !Array.isArray(input.projects)) {
+        throw new Error("守护进程返回了不完整的 1.0 状态；请运行 codex-mcp restart");
+    }
+    const mode = input.mode;
+    if (mode !== "local" && mode !== "public") {
+        throw new Error("守护进程状态中的运行模式无效");
+    }
+    const runtimeIntent = input.runtimeIntent;
+    if (runtimeIntent.local !== (mode === "local")) {
+        throw new Error("守护进程状态的 mode 与 runtimeIntent 不一致");
+    }
+    const tunnel = normalizeTunnelObservedStatus(input.tunnel);
+    const auth = input.auth;
+    const startedAt = input.startedAt;
+    const projects = input.projects.map(normalizeDaemonProject);
     return {
-        ...(raw as DaemonStatusPayload),
+        controlApiVersion: DAEMON_CONTROL_API_VERSION,
+        ok: true,
+        version: input.version,
         mode,
+        pid: input.pid as number,
         startedAt,
+        uptimeMs: input.uptimeMs as number,
+        localUrl: input.localUrl,
+        ...(typeof input.publicMcpUrl === "string" ? { publicMcpUrl: input.publicMcpUrl } : {}),
         runtimeIntent,
         tunnel,
+        auth,
+        projects,
+    };
+}
+
+function isDaemonAuth(value: unknown): value is { required: boolean; configured: boolean } {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const auth = value as Record<string, unknown>;
+    return typeof auth.required === "boolean" && typeof auth.configured === "boolean";
+}
+
+function normalizeDaemonProject(value: unknown): DaemonStatusPayload["projects"][number] {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("守护进程状态包含无效项目");
+    }
+    const project = value as Record<string, unknown>;
+    if (typeof project.id !== "string" || typeof project.name !== "string" ||
+        typeof project.path !== "string" || typeof project.active !== "boolean" ||
+        typeof project.addedAt !== "string" || typeof project.lastSeenAt !== "string" ||
+        !Number.isInteger(project.boundSessions) || (project.boundSessions as number) < 0) {
+        throw new Error("守护进程状态包含不完整项目");
+    }
+    return {
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        active: project.active,
+        addedAt: project.addedAt,
+        lastSeenAt: project.lastSeenAt,
+        boundSessions: project.boundSessions as number,
     };
 }
 
@@ -209,16 +272,25 @@ function isRuntimeIntent(value: unknown): value is RuntimeIntent {
 function normalizeTunnelObservedStatus(
     value: { running?: unknown; state?: unknown; restartCount?: unknown; detail?: unknown } | undefined,
 ): TunnelObservedStatus {
-    const running = value?.running === true;
-    const state = isTunnelObservedState(value?.state)
-        ? value.state
-        : running ? "connected" : "off";
+    if (!isTunnelObservedStatus(value)) {
+        throw new Error("守护进程状态包含无效 Tunnel 状态");
+    }
+    const running = value.running;
+    const state = value.state;
     return {
         running,
         state,
         ...(typeof value?.restartCount === "number" ? { restartCount: value.restartCount } : {}),
         ...(typeof value?.detail === "string" ? { detail: value.detail } : {}),
     };
+}
+
+function isTunnelObservedStatus(value: unknown): value is TunnelObservedStatus {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const status = value as Record<string, unknown>;
+    return typeof status.running === "boolean" && isTunnelObservedState(status.state) &&
+        (status.restartCount === undefined || (Number.isInteger(status.restartCount) && (status.restartCount as number) >= 0)) &&
+        (status.detail === undefined || typeof status.detail === "string");
 }
 
 function isTunnelObservedState(value: unknown): value is TunnelObservedState {
@@ -250,20 +322,20 @@ export async function contactRunningDaemon(): Promise<DaemonContact | undefined>
     const state = loadDaemonState();
     if (!state || !isProcessAlive(state.pid)) return undefined;
     try {
-        const client = new DaemonControlClient(state.port, state.controlToken);
+        const client = new DaemonControlClient(state.port, state.controlToken, 10_000, state.host);
         const status = await client.status();
-        if (!status.ok || status.pid !== state.pid) return undefined;
+        if (status.pid !== state.pid) throw new Error("daemon 状态与控制接口 PID 不一致");
         return {
             state: {
                 ...state,
-                mode: status.mode,
                 runtimeIntent: status.runtimeIntent,
-                publicMcpUrl: status.publicMcpUrl,
+                ...(status.publicMcpUrl ? { publicMcpUrl: status.publicMcpUrl } : {}),
             },
             client,
         };
-    } catch {
-        return undefined;
+    } catch (error) {
+        if (!isProcessAlive(state.pid)) return undefined;
+        throw new Error(`daemon pid ${state.pid} 仍存在，但控制接口不可用；已停止操作：${error instanceof Error ? error.message : String(error)}`);
     }
 }
 
@@ -288,6 +360,7 @@ export interface SpawnDaemonOptions {
 export interface SpawnedDaemonProcess {
     pid: number;
     exited: Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: string }>;
+    terminate: () => Promise<void>;
 }
 
 /**
@@ -310,7 +383,7 @@ export function spawnDaemonProcess(options: SpawnDaemonOptions): SpawnedDaemonPr
         detached: true,
         // Fully detach the daemon from the parent terminal so the calling
         // shell does not wait on it and Ctrl+C does not reach it.
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
         windowsHide: true,
         env: process.env,
     });
@@ -337,19 +410,40 @@ export function spawnDaemonProcess(options: SpawnDaemonOptions): SpawnedDaemonPr
         });
     });
     child.unref();
-    return { pid: child.pid ?? 0, exited };
+    return { pid: child.pid ?? 0, exited, terminate: () => terminateChildProcess(child, 5_000, 2_000) };
 }
 
 /** Spawn and wait for a daemon. Caller must hold the lifecycle lock. */
-export async function startDaemonForIntent(intent: RuntimeIntent): Promise<DaemonContact> {
+export async function startDaemonForIntent(
+    intent: RuntimeIntent,
+    options: { timeoutMs?: number } = {},
+): Promise<DaemonContact> {
+    const controller = new AbortController();
+    const cancel = () => controller.abort(new Error("已取消守护进程启动"));
+    process.once("SIGINT", cancel);
+    process.once("SIGTERM", cancel);
     const spawned = spawnDaemonProcess(intent);
-    return await waitForDaemonStart(spawned.pid, spawned.exited);
+    try {
+        return await waitForDaemonStart(spawned.pid, spawned.exited, {
+            ...options,
+            signal: controller.signal,
+        });
+    } catch (error) {
+        // This ChildProcess belongs to this start attempt. Never terminate a PID
+        // inferred from a stale state file or a different running instance.
+        await spawned.terminate();
+        if (loadDaemonState()?.pid === spawned.pid) await removeDaemonState();
+        throw error;
+    } finally {
+        process.off("SIGINT", cancel);
+        process.off("SIGTERM", cancel);
+    }
 }
 
 /** Gracefully stop one contacted daemon. Caller must hold the lifecycle lock. */
 export async function stopDaemonContact(
     daemon: DaemonContact,
-    timeoutMs = 20_000,
+    timeoutMs = DAEMON_STOP_TIMEOUT_MS,
 ): Promise<void> {
     await daemon.client.shutdown();
     const deadline = Date.now() + timeoutMs;
@@ -380,20 +474,17 @@ function resolveCliEntryPath(): string {
 export async function waitForDaemonStart(
     pid: number,
     exited?: SpawnedDaemonProcess["exited"],
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<DaemonContact> {
-    const deadline = Date.now() + DAEMON_START_TIMEOUT_MS;
+    const deadline = Date.now() + (options.timeoutMs ?? DAEMON_START_TIMEOUT_MS);
     let lastError = "守护进程没有写入状态文件";
     let observedExit: Awaited<SpawnedDaemonProcess["exited"]> | undefined;
     void exited?.then((result) => {
         observedExit = result;
     });
     while (Date.now() < deadline) {
+        options.signal?.throwIfAborted();
         if (observedExit) throw daemonExitedError(observedExit);
-        const contact = await contactRunningDaemon();
-        if (contact) {
-            if (contact.state.pid === pid) return contact;
-            throw new Error(`检测到另一个守护进程 pid ${contact.state.pid}，拒绝把它当成本次启动结果`);
-        }
         const state = loadDaemonState();
         if (!isProcessAlive(pid)) {
             throw new Error(
@@ -401,9 +492,11 @@ export async function waitForDaemonStart(
             );
         }
         if (state) {
+            if (state.pid !== pid) throw new Error(`检测到另一个守护进程 pid ${state.pid}，拒绝把它当成本次启动结果`);
             try {
-                const client = new DaemonControlClient(state.port, state.controlToken, 2_000);
+                const client = new DaemonControlClient(state.port, state.controlToken, 2_000, state.host);
                 const status = await client.status();
+                options.signal?.throwIfAborted();
                 if (state.pid === pid && status.pid === pid) return { state, client };
                 lastError = `状态文件 pid ${state.pid} 与本次 pid ${pid} 不一致`;
             } catch (error) {
@@ -428,18 +521,9 @@ function daemonExitedError(
     );
 }
 
-/**
- * Serialize daemon startup across concurrent CLI invocations. The lock is
- * stale when its owner process is dead or the file is older than the grace
- * window, so a crash cannot leave a permanent lock.
- */
-export async function withDaemonStartLock<T>(run: () => Promise<T>): Promise<T> {
-    return await withDaemonLifecycleLock(run);
-}
-
 /** Serialize every daemon start/stop and public setup transition. */
 export async function withDaemonLifecycleLock<T>(run: () => Promise<T>): Promise<T> {
-    const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+    const deadline = Date.now() + DAEMON_LIFECYCLE_LOCK_WAIT_TIMEOUT_MS;
     while (Date.now() < deadline) {
         let release: (() => void) | undefined;
         try {
