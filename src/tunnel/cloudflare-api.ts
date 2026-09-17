@@ -3,7 +3,7 @@ import { safeHttpRequest } from "../lib/http/safe-http.js";
 import { normalizeTunnelId } from "./id.js";
 
 const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
-const API_TIMEOUT_MS = 120_000;
+const API_TIMEOUT_MS = 30_000;
 const MAX_API_BODY_CHARS = 2 * 1024 * 1024;
 const DNS_TYPES_WITH_DATA = new Set([
     "CAA", "CERT", "DNSKEY", "DS", "HTTPS", "LOC", "NAPTR",
@@ -81,6 +81,18 @@ export function dnsSnapshotReferencesTunnel(
     tunnelId: string,
 ): boolean {
     return snapshot.records.some((record) => dnsRecordTargetsTunnel(record, tunnelId));
+}
+
+/** Remove a former codex-mcp hostname only while it still exactly targets that managed Tunnel. */
+export async function removeCloudflareManagedDnsIfOwned(
+    zoneId: string,
+    hostname: string,
+    tunnelId: string,
+): Promise<boolean> {
+    const snapshot = await snapshotCloudflareDns(zoneId, hostname);
+    if (!dnsSnapshotPointsToTunnel(snapshot, tunnelId)) return false;
+    await deleteDnsRecords(zoneId, snapshot.records);
+    return true;
 }
 
 function dnsRecordTargetsTunnel(
@@ -192,10 +204,15 @@ export async function inspectCloudflareTunnel(
 ): Promise<CloudflareTunnelObserved> {
     const normalizedTunnelId = normalizeTunnelId(tunnelId);
     try {
-        const tunnel = await cloudflareApiRequest<{ status?: unknown }>(
+        const tunnel = await cloudflareApiRequest<{ status?: unknown; deleted_at?: unknown }>(
             "GET",
             `/accounts/${encodeURIComponent(accountId)}/cfd_tunnel/${encodeURIComponent(normalizedTunnelId)}`,
         );
+        // Cloudflare soft-deletes tunnels: the detail endpoint can keep returning
+        // HTTP 200 with deleted_at populated even though the tunnel disappeared
+        // from the active list. Treat that state as absent and do not query
+        // connections for an object that can no longer be used.
+        if (isDeletedCloudflareTunnelRecord(tunnel)) return { exists: false };
         const connections = await cloudflareApiRequest<unknown[]>(
             "GET",
             `/accounts/${encodeURIComponent(accountId)}/cfd_tunnel/${encodeURIComponent(normalizedTunnelId)}/connections`,
@@ -342,6 +359,10 @@ function partialDnsError(prefix: string, original: unknown, restore: unknown): E
 
 function readableError(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+export function isDeletedCloudflareTunnelRecord(value: { deleted_at?: unknown }): boolean {
+    return value.deleted_at !== undefined && value.deleted_at !== null;
 }
 
 function isTunnelStatus(

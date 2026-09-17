@@ -25,6 +25,7 @@ const TUNNEL_ID_RE =
 export async function ensureLogin(
     bin: string,
     force: boolean,
+    options: { signal?: AbortSignal; onOutput?: (text: string) => void } = {},
 ): Promise<CloudflareOriginToken> {
     if (!force && hasManagedCloudflareLogin()) {
         printSuccess("已登录 Cloudflare，无需重复登录。");
@@ -41,11 +42,22 @@ export async function ensureLogin(
     const candidateCert = join(candidateHome, ".cloudflared", "cert.pem");
     try {
         printInfo("正在打开浏览器，请登录 Cloudflare 并完成授权…");
-        const code = await runCloudflaredInherit(
-            bin,
-            cloudflaredManagementArgs("login"),
-            { managedHome: candidateHome },
-        );
+        const code = options.signal || options.onOutput
+            ? (await runCloudflared(
+                  bin,
+                  cloudflaredManagementArgs("login"),
+                  {
+                      managedHome: candidateHome,
+                      allowFailure: true,
+                      signal: options.signal,
+                      onOutput: options.onOutput,
+                  },
+              )).code ?? 1
+            : await runCloudflaredInherit(
+                  bin,
+                  cloudflaredManagementArgs("login"),
+                  { managedHome: candidateHome },
+              );
         if (code !== 0 || !existsSync(candidateCert)) {
             throw new Error("Cloudflare 登录没有完成；旧登录保持不变");
         }
@@ -64,20 +76,28 @@ export async function ensureTunnelCreated(
     accountId: string,
     knownId?: string,
 ): Promise<{ id: string; name: string; created: boolean }> {
-    const existing = await withSpinner(
+    const tunnels = await withSpinner(
         "正在检查现有 Cloudflare Tunnel…",
         "Cloudflare Tunnel 检查完成",
-        () => findTunnelIdByName(bin, preferredName),
+        () => listTunnels(bin),
     );
-    if (knownId && existing === knownId && hasMatchingCredential(knownId, accountId)) {
-        printSuccess(`继续使用现有 Tunnel：${preferredName}`);
-        return { id: knownId, name: preferredName, created: false };
-    }
-    if (existing && hasMatchingCredential(existing, accountId)) {
-        printSuccess(`继续使用现有 Tunnel：${preferredName}`);
-        return { id: existing, name: preferredName, created: false };
+    const exactMatches = tunnels.filter((item) => item.name === preferredName);
+    if (exactMatches.length > 1) throw new Error(`存在多个同名 Tunnel：${preferredName}`);
+    const reusable = selectReusableTunnel(
+        tunnels,
+        preferredName,
+        (id) => hasMatchingCredential(id, accountId),
+        knownId,
+    );
+    if (reusable) {
+        if (reusable.name !== preferredName) {
+            printInfo(`找到本机已有的历史 Tunnel：${reusable.name}`);
+        }
+        printSuccess(`继续使用现有 Tunnel：${reusable.name}`);
+        return { id: reusable.id, name: reusable.name, created: false };
     }
 
+    const existing = exactMatches[0]?.id;
     let name = preferredName;
     if (existing) {
         name = `${preferredName}-${randomUUID().slice(0, 8)}`;
@@ -185,48 +205,61 @@ async function deleteTunnel(bin: string, tunnelId: string): Promise<void> {
     }
 }
 
-async function findTunnelIdByName(
-    bin: string,
-    tunnelName: string,
-): Promise<string | undefined> {
+interface ListedTunnel {
+    id: string;
+    name: string;
+}
+
+export function selectReusableTunnel(
+    tunnels: ListedTunnel[],
+    preferredName: string,
+    ownsCredential: (id: string) => boolean,
+    knownId?: string,
+): ListedTunnel | undefined {
+    const owned = tunnels.filter((item) => ownsCredential(item.id));
+    if (knownId) {
+        const known = owned.find((item) => item.id === knownId);
+        if (known) return known;
+    }
+    const family = owned.filter(
+        (item) => item.name === preferredName || item.name.startsWith(`${preferredName}-`),
+    );
+    const exact = family.find((item) => item.name === preferredName);
+    if (exact) return exact;
+    if (family.length > 0) {
+        // A suffixed name is created only when the default name was already occupied.
+        // Matching local credentials prove the tunnel belongs to this codex-mcp home.
+        return [...family].sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id))[0];
+    }
+    // Hostnames can change (for example a Mac DHCP hostname), which changes the
+    // default tunnel name. If this private codex-mcp home owns exactly one active
+    // Tunnel in the account, that ownership proof is stronger than the display name.
+    return owned.length === 1 ? owned[0] : undefined;
+}
+
+async function listTunnels(bin: string): Promise<ListedTunnel[]> {
     const jsonAttempt = await runCloudflared(
         bin,
         cloudflaredManagementArgs("list", "--output", "json"),
         { allowFailure: true, timeoutMs: 180_000 },
     );
-    if (jsonAttempt.code === 0 && jsonAttempt.stdout.trim()) {
-        try {
-            const rows = JSON.parse(jsonAttempt.stdout) as Array<{ id?: string; name?: string }>;
-            const hit = rows.find((row) => row.name === tunnelName);
-            return hit?.id;
-        } catch {
-            // Fall through to the human-readable table for older cloudflared.
-        }
+    if (jsonAttempt.code !== 0) {
+        throw new Error((jsonAttempt.stderr || jsonAttempt.stdout).trim() || `无法读取 Cloudflare Tunnel 列表（退出代码 ${jsonAttempt.code}）`);
     }
-    const list = await runCloudflared(bin, cloudflaredManagementArgs("list"), {
-        allowFailure: true,
-        timeoutMs: 180_000,
-    });
-    if (list.code !== 0) {
-        throw new Error(
-            (list.stderr || list.stdout).trim() ||
-            `无法读取 Cloudflare Tunnel 列表（退出代码 ${list.code}）`,
-        );
+    const rows: unknown = JSON.parse(jsonAttempt.stdout);
+    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row.id !== "string" || typeof row.name !== "string")) {
+        throw new Error("cloudflared 返回了无效的 Tunnel JSON 列表；请更新 cloudflared");
     }
-    return findTunnelIdInListText(`${list.stdout}\n${list.stderr}`, tunnelName);
+    return rows.map((row) => ({ id: row.id, name: row.name }));
 }
 
-function findTunnelIdInListText(
-    text: string,
+async function findTunnelIdByName(
+    bin: string,
     tunnelName: string,
-): string | undefined {
-    const exactName = new RegExp(`(?:^|\\s)${escapeRegExp(tunnelName)}(?:\\s|$)`);
-    for (const line of text.split(/\r?\n/)) {
-        if (!exactName.test(line)) continue;
-        const id = line.match(TUNNEL_ID_RE)?.[0];
-        if (id) return id;
-    }
-    return undefined;
+): Promise<string | undefined> {
+    const matches = (await listTunnels(bin)).filter((row) => row.name === tunnelName);
+    if (matches.length > 1) throw new Error(`存在多个同名 Tunnel：${tunnelName}`);
+    return matches[0]?.id;
 }
 
 function cloudflaredManagementArgs(...args: string[]): string[] {
@@ -235,10 +268,6 @@ function cloudflaredManagementArgs(...args: string[]): string[] {
         command.push("--origincert", getCloudflareOriginCertPath());
     }
     return [...command, ...args];
-}
-
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function readableError(error: unknown): string {
